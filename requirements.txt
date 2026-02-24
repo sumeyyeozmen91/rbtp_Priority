@@ -1,2 +1,16 @@
 streamlit==1.37.0
 pandas==2.2.2
+numpy==1.26.4
+
+# Optional but recommended for file handling & performance
+python-dateutil==2.9.0.post0
+pytz==2024.1
+tzdata==2024.1
+
+# Optional (future extensibility – safe to include)
+openpyxl==3.1.5
+xlrd==2.0.1
+
+# Optional (HTML parsing if needed later)
+beautifulsoup4==4.12.3
+lxml==5.2.2
