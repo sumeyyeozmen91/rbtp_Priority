@@ -36,16 +36,11 @@ def pick_column(df, candidates):
     return None
 
 def parse_steps_maybe(json_text: str) -> str:
-    """
-    Xray 'Manual Test Steps' bazen JSON listesi (Action/Expected).
-    Bunu tek metne çevirip risk kelimelerini yakalamayı kolaylaştırır.
-    """
     t = safe_text(json_text).strip()
     if not t:
         return ""
     if not (t.startswith("[") or t.startswith("{")):
         return t
-
     try:
         obj = json.loads(t)
         if isinstance(obj, list):
@@ -63,7 +58,6 @@ def parse_steps_maybe(json_text: str) -> str:
             return json.dumps(obj, ensure_ascii=False)
     except Exception:
         return t
-
     return t
 
 def reorder_priority_columns(df, priority_col, rbtp_col):
@@ -75,19 +69,17 @@ def reorder_priority_columns(df, priority_col, rbtp_col):
 
 
 # -------------------------------
-# RBTP Engine (WhatsApp-like Discover rules)
+# RBTP Engine (Discover/Channel WhatsApp-like)
 # -------------------------------
 def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str):
     """
     WhatsApp-like table for Discover:
       - Discover open edilemiyor -> Gating
-      - Search çalışmıyor -> Gating
-      - Back çalışmıyor -> Gating
-      - Hero click çalışmıyor -> Gating
-      - Popular list yanlış -> High
+      - Search çalışmıyor        -> Gating  (no negative-word dependency)
+      - Back çalışmıyor          -> Gating
+      - Hero click çalışmıyor    -> Gating
+      - Popular list yanlış      -> High
     Plus generic crash/privacy/core interaction fallbacks.
-
-    Returns: (RBTP_Priority, RBTP_ChangeReason, RBTP_RiskType)
     """
     s = (summary or "").lower()
     p = (repo_path or "").lower()
@@ -95,7 +87,7 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str):
     e = (expected or "").lower()
     text = " | ".join([s, p, a, e])
 
-    # 0) Crash / App unusable
+    # 0) Crash / app unusable
     crash_kw = ["crash", "crashlytics", "fatal", "exception", "sigabrt",
                 "çök", "çöküyor", "force close", "uygulama kapan", "kapanıyor"]
     if any(k in text for k in crash_kw):
@@ -107,7 +99,7 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str):
     if any(k in text for k in privacy_kw):
         return ("Gating", "Privacy/Security risk → must be Gating", "Privacy")
 
-    # 2) Discover / Channel detection
+    # 2) Discover/Channel detection
     is_discover = (
         "/discover" in p
         or "/channel" in p
@@ -118,7 +110,13 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str):
     )
 
     if is_discover:
-        # 2.1 Discover open edilemiyor -> Gating
+        # Cosmetic-only search cases (if explicitly UI/cosmetic)
+        search_cosmetic = [
+            "placeholder", "hint text", "ui", "color", "renk", "ikon", "icon",
+            "alignment", "hizalama", "padding", "font", "spelling", "typo"
+        ]
+
+        # 2.1 Discover open broken -> Gating
         open_patterns = [
             "discover open", "open discover", "keşfet aç", "keşfet ekran",
             "discover tab", "keşfet tab", "start discover", "keşfete başla",
@@ -128,27 +126,25 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str):
         if any(k in text for k in open_patterns):
             return ("Gating", "Discover access/open broken → Gating (core entry)", "DiscoverCore")
 
-        # 2.2 Search çalışmıyor -> Gating
-        search_patterns = [
-            "search", "arama", "find", "bul",
-            "search button", "search icon", "arama buton", "arama ikon"
-        ]
-        search_negative = [
-            "doesn't work", "not working", "cannot", "can't",
-            "çalışmıyor", "tıklanamaz", "açılmıyor",
-            "error", "fail", "başarısız", "no results"
-        ]
-        if any(k in text for k in search_patterns) and any(n in text for n in search_negative):
-            return ("Gating", "Discover search broken → Gating (primary discovery mechanism)", "DiscoverCore")
+        # ✅ 2.2 Search scenarios -> default Gating (no negative keyword needed)
+        is_search_case = (
+            "/search" in p
+            or " search" in f" {text}"
+            or "arama" in text
+            or "ara " in text
+            or "arat" in text
+        )
+        if is_search_case and not any(k in text for k in search_cosmetic):
+            return ("Gating", "Discover search is primary mechanism → Gating", "DiscoverCore")
 
-        # 2.3 Back çalışmıyor -> Gating
+        # 2.3 Back broken -> Gating (needs negative cue)
         back_patterns = ["back button", "geri", "navigate back", "geri dön", "geri buton", "landing page back"]
         back_negative = ["çalışmıyor", "doesn't work", "not working", "cannot", "can't",
-                         "tıklanamaz", "stuck", "kill", "donuyor"]
+                         "tıklanamaz", "stuck", "kill", "donuyor", "çıkamıyor"]
         if any(k in text for k in back_patterns) and any(n in text for n in back_negative):
             return ("Gating", "Back navigation broken → user can get stuck → Gating", "DiscoverCore")
 
-        # 2.4 Hero click çalışmıyor -> Gating
+        # 2.4 Hero click broken -> Gating (needs negative cue)
         hero_patterns = ["hero", "banner", "carousel", "slider", "kampanya", "duyuru"]
         click_patterns = ["click", "tap", "tıkla", "tıklama", "tıklan", "open", "navigate"]
         click_negative = ["çalışmıyor", "tıklanamaz", "doesn't work", "not working", "cannot", "can't"]
@@ -162,7 +158,7 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str):
         if any(k in text for k in popular_patterns) and any(w in text for w in wrong_patterns):
             return ("High", "Curation/placement issue (business/growth) → High", "ContentCuration")
 
-        # 2.6 Other channel/discover management -> High
+        # 2.6 Other discover/channel management -> High
         manage_kw = ["follow", "unfollow", "subscribe", "unsubscribe", "create", "edit", "delete", "avatar", "name"]
         if any(k in text for k in manage_kw):
             return ("High", "Channel/Discover management interaction affected → High", "CoreInteraction")
@@ -197,7 +193,6 @@ if not uploaded:
     st.info("Bir CSV yükleyince RBTP_Priority hesaplayıp indirilebilir dosya üreteceğim.")
     st.stop()
 
-# Read CSV
 try:
     df = pd.read_csv(uploaded, sep=sep, dtype=str, keep_default_na=False)
 except Exception as ex:
@@ -206,29 +201,23 @@ except Exception as ex:
 
 st.success(f"Yüklendi: {len(df):,} satır, {len(df.columns)} kolon")
 
-# Auto-detect columns
 default_summary = pick_column(df, ["Summary"])
 default_repo = pick_column(df, ["Custom field (Test Repository Path)", "Test Repository Path", "RepositoryPath", "Repository Path"])
 default_steps = pick_column(df, ["Custom field (Manual Test Steps)", "Manual Test Steps", "Actions", "Action"])
 default_expected = pick_column(df, ["Custom field (Scenario Expected Result)", "Scenario Expected Result", "Expected", "Expected Result"])
 default_priority = pick_column(df, ["Priority"])
 
-# Let user override
 summary_col = st.sidebar.selectbox("Summary kolonu", options=df.columns,
                                   index=(df.columns.get_loc(default_summary) if default_summary else 0))
 repo_col = st.sidebar.selectbox("RepositoryPath kolonu", options=df.columns,
                                 index=(df.columns.get_loc(default_repo) if default_repo else 0))
-
 steps_col = st.sidebar.selectbox("Actions/Steps kolonu", options=["(yok)"] + list(df.columns),
                                  index=(1 + df.columns.get_loc(default_steps) if default_steps else 0))
-
 expected_col = st.sidebar.selectbox("Expected kolonu", options=["(yok)"] + list(df.columns),
                                     index=(1 + df.columns.get_loc(default_expected) if default_expected else 0))
-
 priority_col = st.sidebar.selectbox("Mevcut Priority kolonu", options=["(yok)"] + list(df.columns),
                                     index=(1 + df.columns.get_loc(default_priority) if default_priority else 0))
 
-# Build derived texts
 summaries = df[summary_col].map(safe_text)
 repo_paths = df[repo_col].map(safe_text)
 
@@ -242,32 +231,27 @@ if expected_col != "(yok)":
 else:
     expected_text = pd.Series([""] * len(df))
 
-# Normalize current priority if exists
 if priority_col != "(yok)":
     df["CurrentPriority"] = df[priority_col].map(normalize_priority)
 else:
     df["CurrentPriority"] = ""
 
-# Compute RBTP
 rbtp = [
     classify_rbtp(summaries.iat[i], repo_paths.iat[i], steps_text.iat[i], expected_text.iat[i])
     for i in range(len(df))
 ]
+
 df["RBTP_Priority"] = [x[0] for x in rbtp]
 df["RBTP_ChangeReason"] = [x[1] for x in rbtp]
 df["RBTP_RiskType"] = [x[2] for x in rbtp]
-
 df["RBTP_Changed"] = (df["CurrentPriority"] != "") & (df["CurrentPriority"] != df["RBTP_Priority"])
 
-# Move RBTP_Priority next to existing Priority column
 if priority_col != "(yok)":
     df = reorder_priority_columns(df, priority_col, "RBTP_Priority")
 
-# Preview
 st.subheader("Önizleme (ilk 50 satır)")
 st.dataframe(df.head(50), use_container_width=True)
 
-# Stats
 st.subheader("Dağılım")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -281,7 +265,6 @@ with c3:
         st.write("Değişen (RBTP_Changed=True)")
         st.write(int(df["RBTP_Changed"].sum()))
 
-# Download
 st.subheader("İndir")
 out = io.StringIO()
 df.to_csv(out, sep=";", index=False)
