@@ -2,12 +2,11 @@ import streamlit as st
 import pandas as pd
 import io
 import json
-import re
 
 st.set_page_config(page_title="RBTP Prioritizer", layout="wide")
 
 st.title("RBTP – Risk-Based Test Prioritization")
-st.caption("CSV yükle → RBTP_Priority hesapla → Priority ile yan yana yerleştir → indir")
+st.caption("CSV yükle → RBTP_Priority hesapla → (Priority + RBTP_Priority) en sona koy → karşılaştırmalı dağılım → indir")
 
 # -------------------------------
 # Helpers
@@ -26,7 +25,6 @@ def normalize_priority(val: str) -> str:
         return "Medium"
     if s in ["p3", "low"]:
         return "Low"
-    # unknown -> keep original (but title-case like)
     return str(val).strip()
 
 def pick_column(df, candidates):
@@ -52,7 +50,6 @@ def parse_steps_maybe(json_text: str) -> str:
 
     try:
         obj = json.loads(t)
-        # list of steps
         if isinstance(obj, list):
             lines = []
             for step in obj:
@@ -64,7 +61,6 @@ def parse_steps_maybe(json_text: str) -> str:
                 if exp:
                     lines.append(f"EXPECTED: {exp}")
             return "\n".join(lines)
-        # dict
         if isinstance(obj, dict):
             return json.dumps(obj, ensure_ascii=False)
     except Exception:
@@ -107,10 +103,8 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str,
     if any(p in text for p in privacy_patterns):
         return ("Gating", "Privacy/Security risk → must be Gating", "Privacy")
 
-    # ---- status core switch (senin kararın) ----
-    # Eğer Status core ise: /Status altında core akışlar gating
-    if mode_status_core and repo_path.lower().startswith("/status"):
-        # enhancement inside status
+    # ---- status core switch ----
+    if mode_status_core and safe_text(repo_path).lower().startswith("/status"):
         enh = ["sticker", "emoji", "reaction", "gif", "search", "filter", "animation", "animasyon"]
         if any(p in text for p in enh):
             return ("Medium", "Enhancement inside core Status → Medium", "Enhancement")
@@ -118,9 +112,8 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str,
             return ("High", "Interaction inside core Status → High", "CoreInteraction")
         return ("Gating", "Status is CORE → core status flow must be Gating", "CoreFlow")
 
-    # ---- channels heuristics (senin Channel örneklerinle uyumlu) ----
-    if repo_path.lower().startswith("/channels"):
-        # consumption (open/view/play/download/receive attachments) => gating
+    # ---- channels heuristics ----
+    if safe_text(repo_path).lower().startswith("/channels"):
         consumption = ["open", "view", "play", "download", "receive", "watch", "listen", "open the", "click on"]
         attachment_markers = ["attachment", "audio", "video", "document", "media", "zip", "pdf", "jpg", "png"]
         if any(p in text for p in consumption) and any(p in text for p in attachment_markers):
@@ -144,12 +137,12 @@ def classify_rbtp(summary: str, repo_path: str, steps: str, expected: str,
     # ---- default ----
     return ("Medium", "Default non-blocking scenario → Medium", "Enhancement")
 
-
-def reorder_priority_columns(df, priority_col, rbtp_col):
+def move_cols_to_end(df, cols_in_order):
     cols = list(df.columns)
-    if priority_col in cols and rbtp_col in cols:
-        cols.remove(rbtp_col)
-        cols.insert(cols.index(priority_col) + 1, rbtp_col)
+    for c in cols_in_order:
+        if c in cols:
+            cols.remove(c)
+    cols.extend([c for c in cols_in_order if c in df.columns])
     return df[cols]
 
 
@@ -189,34 +182,46 @@ default_priority = pick_column(df, ["Priority", "CurrentPriority"])
 # Let user override
 summary_col = st.sidebar.selectbox("Summary kolonu", options=df.columns, index=(df.columns.get_loc(default_summary) if default_summary else 0))
 repo_col = st.sidebar.selectbox("RepositoryPath kolonu", options=df.columns, index=(df.columns.get_loc(default_repo) if default_repo else 0))
-steps_col = st.sidebar.selectbox("Actions/Steps kolonu", options=["(yok)"] + list(df.columns),
-                                 index=(1 + df.columns.get_loc(default_steps) if default_steps else 0))
-expected_col = st.sidebar.selectbox("Expected kolonu", options=["(yok)"] + list(df.columns),
-                                    index=(1 + df.columns.get_loc(default_expected) if default_expected else 0))
-priority_col = st.sidebar.selectbox("Mevcut Priority kolonu", options=["(yok)"] + list(df.columns),
-                                    index=(1 + df.columns.get_loc(default_priority) if default_priority else 0))
+steps_col = st.sidebar.selectbox(
+    "Actions/Steps kolonu",
+    options=["(yok)"] + list(df.columns),
+    index=(1 + df.columns.get_loc(default_steps) if default_steps else 0)
+)
+expected_col = st.sidebar.selectbox(
+    "Expected kolonu",
+    options=["(yok)"] + list(df.columns),
+    index=(1 + df.columns.get_loc(default_expected) if default_expected else 0)
+)
+priority_col = st.sidebar.selectbox(
+    "Mevcut Priority kolonu",
+    options=["(yok)"] + list(df.columns),
+    index=(1 + df.columns.get_loc(default_priority) if default_priority else 0)
+)
 
 # Build derived texts
 summaries = df[summary_col].map(safe_text)
 repo_paths = df[repo_col].map(safe_text)
 
-steps_text = ""
 if steps_col != "(yok)":
     steps_text = df[steps_col].map(parse_steps_maybe)
 else:
     steps_text = pd.Series([""] * len(df))
 
-expected_text = ""
 if expected_col != "(yok)":
     expected_text = df[expected_col].map(safe_text)
 else:
     expected_text = pd.Series([""] * len(df))
 
-# Normalize current priority if exists
+# ---- Priority handling (NO CurrentPriority column) ----
+# Output will have a single column named "Priority" (normalized).
+# Also drop the original selected priority column from output (unless it's already "Priority").
 if priority_col != "(yok)":
-    df["CurrentPriority"] = df[priority_col].map(normalize_priority)
+    df["Priority"] = df[priority_col].map(normalize_priority)
+
+    if priority_col != "Priority" and priority_col in df.columns:
+        df.drop(columns=[priority_col], inplace=True)
 else:
-    df["CurrentPriority"] = ""
+    df["Priority"] = ""
 
 # Compute RBTP
 rbtp = [
@@ -229,29 +234,76 @@ df["RBTP_Priority"] = [x[0] for x in rbtp]
 df["RBTP_ChangeReason"] = [x[1] for x in rbtp]
 df["RBTP_RiskType"] = [x[2] for x in rbtp]
 
-df["RBTP_Changed"] = (df["CurrentPriority"] != "") & (df["CurrentPriority"] != df["RBTP_Priority"])
+df["RBTP_Changed"] = (df["Priority"] != "") & (df["Priority"] != df["RBTP_Priority"])
 
-# Move RBTP_Priority next to Priority (if provided)
-if priority_col != "(yok)":
-    df = reorder_priority_columns(df, priority_col, "RBTP_Priority")
+# Move Priority + RBTP_Priority to the end (last two columns)
+df = move_cols_to_end(df, ["Priority", "RBTP_Priority"])
 
 # Preview
 st.subheader("Önizleme")
 st.dataframe(df.head(50), use_container_width=True)
 
-# Stats
-st.subheader("Dağılım")
-c1, c2, c3 = st.columns(3)
+# -------------------------------
+# Dağılım + Değişim Analizi
+# -------------------------------
+st.subheader("Dağılım ve Değişim Analizi")
+
+prev_counts = df["Priority"].fillna("").replace("", "(boş)").value_counts()
+next_counts = df["RBTP_Priority"].fillna("").replace("", "(boş)").value_counts()
+
+compare = pd.DataFrame({
+    "Önceki Adet": prev_counts,
+    "Sonraki Adet": next_counts
+}).fillna(0).astype(int)
+
+compare["Değişim (Adet)"] = compare["Sonraki Adet"] - compare["Önceki Adet"]
+compare["Değişim (%)"] = (
+    compare["Değişim (Adet)"] /
+    compare["Önceki Adet"].replace(0, pd.NA)
+) * 100
+compare["Değişim (%)"] = compare["Değişim (%)"].round(1)
+
+# sıra sabitle
+order = ["Gating", "High", "Medium", "Low", "(boş)"]
+compare = compare.reindex([x for x in order if x in compare.index])
+
+c1, c2, c3 = st.columns([2, 1, 1])
+
 with c1:
-    st.write("RBTP_Priority dağılımı")
-    st.write(df["RBTP_Priority"].value_counts())
+    st.write("Önceki vs Sonraki (adet + fark + oran)")
+    st.dataframe(compare, use_container_width=True)
+
+changed = int(df["RBTP_Changed"].sum())
+total = len(df)
+changed_rate = round(changed / total * 100, 1) if total else 0.0
+
 with c2:
-    st.write("RBTP_RiskType dağılımı")
-    st.write(df["RBTP_RiskType"].value_counts())
+    st.metric("Değişen Senaryo", changed, f"{changed_rate}%")
+
 with c3:
-    if priority_col != "(yok)":
-        st.write("Değişen (RBTP_Changed=True)")
-        st.write(int(df["RBTP_Changed"].sum()))
+    st.metric("Aynı Kalan", total - changed, f"{round(100 - changed_rate, 1)}%")
+
+# Ek KPI: Gating'e yükselen/düşen
+priority_norm = df["Priority"].replace("", "(boş)")
+rbtp_norm = df["RBTP_Priority"].replace("", "(boş)")
+
+up_to_gating = int(((priority_norm != "Gating") & (rbtp_norm == "Gating")).sum())
+down_from_gating = int(((priority_norm == "Gating") & (rbtp_norm != "Gating")).sum())
+net_gating = up_to_gating - down_from_gating
+
+k1, k2, k3 = st.columns(3)
+k1.metric("Gating'e yükselen", up_to_gating)
+k2.metric("Gating'den düşen", down_from_gating)
+k3.metric("Net Gating değişimi", net_gating)
+
+# Transition Matrix
+st.write("Priority → RBTP_Priority geçiş matrisi")
+transition = pd.crosstab(
+    priority_norm,
+    rbtp_norm
+).reindex(index=order, columns=order, fill_value=0)
+
+st.dataframe(transition, use_container_width=True)
 
 # Download
 st.subheader("İndir")
@@ -264,4 +316,4 @@ st.download_button(
     mime="text/csv"
 )
 
-st.caption("Not: Çıktı her zaman ';' ile yazılır (TR Excel uyumlu). İstersen koddan değiştirebilirsin.")
+st.caption("Not: Çıktı her zaman ';' ile yazılır (TR Excel uyumlu).")
