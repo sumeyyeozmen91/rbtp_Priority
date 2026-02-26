@@ -2,12 +2,11 @@ import streamlit as st
 import pandas as pd
 import io
 import json
-import re
 
-st.set_page_config(page_title="RBTP Prioritizer", layout="wide")
+st.set_page_config(page_title="STP – Semantic Test Prioritization", layout="wide")
 
-st.title("RBTP – Risk-Based Test Prioritization (Semantic Heuristic)")
-st.caption("CSV yükle → semantic heuristics ile RBTP_Priority hesapla → dağılım + geçiş → indir")
+st.title("STP – Semantic Test Prioritization")
+st.caption("CSV yükle → STP_Priority (Gating/High/Medium/Low) hesapla → Current vs STP karşılaştır → indir")
 
 # -------------------------------
 # Helpers
@@ -39,6 +38,10 @@ def safe_text(x):
     return "" if pd.isna(x) else str(x)
 
 def parse_steps_maybe(json_text: str) -> str:
+    """
+    Xray 'Manual Test Steps' bazen JSON listesi (Action/Expected).
+    Tek metne çevirir.
+    """
     t = safe_text(json_text).strip()
     if not t:
         return ""
@@ -72,107 +75,98 @@ def move_cols_to_end(df, cols_in_order):
     return df[cols]
 
 # -------------------------------
-# Semantic-ish rule engine (test case prioritization)
+# STP (Semantic Test Prioritization) Engine
+# (Test-case prioritization, NOT bug-based)
 # -------------------------------
-def find_signals(text: str, patterns: dict) -> list[str]:
+def _find_hits(text: str, groups: dict) -> list[str]:
     hits = []
-    for name, pats in patterns.items():
+    for name, pats in groups.items():
         for p in pats:
             if p in text:
                 hits.append(name)
                 break
     return hits
 
-def classify_rbtp_semantic(summary: str, repo_path: str, steps: str, expected: str, status_core: bool=False):
+def stp_classify(summary: str, repo_path: str, steps: str, expected: str, status_core: bool=False):
     """
-    Test scenario prioritization.
-    Returns: (prio, reason, risktype, matched_signals:list[str])
+    Returns: (STP_Priority, STP_Reason, STP_RiskType, STP_MatchedSignals)
     """
     text = " | ".join([safe_text(summary), safe_text(repo_path), safe_text(steps), safe_text(expected)]).lower()
 
-    # --- signal dictionaries (substring-based) ---
-    RISK_ALWAYS_GATING = {
+    # 1) Always Gating: privacy/security + data loss
+    ALWAYS_GATING = {
         "Privacy/Security": [
             "privacy", "gizlilik", "unauthorized", "yetkisiz", "leak", "sız",
-            "e2e", "encryption", "şifre", "token", "authentication", "otp",
+            "e2e", "encryption", "token", "authentication", "otp", "verification",
             "wrong person", "başkası görüyor", "everyone can see", "only contacts",
             "blocked", "engelle"
         ],
         "DataLoss/Backup": [
             "data loss", "lost", "kaybol", "silin", "deleted", "history",
             "backup", "restore", "icloud", "google drive"
-        ],
+        ]
     }
+    hits = _find_hits(text, ALWAYS_GATING)
+    if hits:
+        if "Privacy/Security" in hits:
+            return ("Gating", "Privacy/Security coverage is release-critical", "Privacy/Security", ", ".join(hits))
+        return ("Gating", "Data loss / backup-restore coverage is release-critical", "DataLoss", ", ".join(hits))
 
+    # 2) Core smoke: must-pass flows => Gating
     CORE_SMOKE = {
         "Login/OTP": ["login", "register", "otp", "sms", "verification", "doğrulama", "kayıt", "giriş"],
-        "ChatTextSendReceive": [
+        "ChatSend/Receive": [
             "send message", "send text", "type message", "write message",
-            "mesaj gönder", "mesaj yolla", "mesaj al", "receive message", "delivered", "read"
+            "mesaj gönder", "mesaj yolla", "receive message", "mesaj al",
+            "delivered", "read", "seen", "okundu"
         ],
         "CallConnect": [
-            "start call", "make call", "call", "voice call", "video call", "incoming call", "outgoing call",
-            "arama başlat", "sesli arama", "görüntülü arama", "çağrı"
+            "start call", "make call", "incoming call", "outgoing call",
+            "voice call", "video call", "answer call",
+            "arama başlat", "sesli arama", "görüntülü arama", "çağrı", "aramayı yanıtla"
         ],
-        "PushNotification": ["push", "notification", "bildirim"]
+        "Notifications": ["push", "notification", "bildirim"]
     }
+    smoke_hits = _find_hits(text, CORE_SMOKE)
+    if smoke_hits:
+        return ("Gating", "Core smoke (must-pass) scenario", "CoreSmoke", ", ".join(smoke_hits))
 
-    VARIATIONS_HIGH = {
+    # 3) High: important variations on core capability
+    HIGH_VARIATIONS = {
         "NetworkVariation": ["offline", "airplane", "roaming", "wifi", "4g", "5g", "network", "internet", "uçak modu"],
-        "BackgroundLock": ["background", "foreground", "screen lock", "locked", "kilit", "ekran kilidi"],
-        "MediaPayload": ["sticker", "emoji", "gif", "image", "photo", "video", "audio", "document", "attachment", "lokasyon", "location"]
+        "Background/Lock": ["background", "foreground", "screen lock", "locked", "kilit", "ekran kilidi"],
+        "MediaPayload": ["sticker", "gif", "emoji", "image", "photo", "video", "audio", "document", "attachment", "location", "lokasyon"],
+        "MultiDevice/SIM": ["multi device", "dual sim"]
     }
+    var_hits = _find_hits(text, HIGH_VARIATIONS)
+    if var_hits:
+        return ("High", "Important variation on core capability", "CoreVariation", ", ".join(var_hits))
 
-    UI_RULES_MEDIUM = {
-        "EditModeRules": ["edit mode", "editing", "edit message", "düzenle", "düzenleme", "edit"],
-        "LongPressMenu": ["long press", "press and hold", "uzun bas", "longpress"],
-        "VisibilityRule": ["should not appear", "must not", "not displayed", "görünmemeli", "olmamalı", "disable", "disabled", "enabled"]
+    # 4) Medium: functional UI rules / interaction rules (edit mode, long press, visibility rules)
+    UI_RULES = {
+        "EditMode": ["edit mode", "editing", "edit message", "düzenle", "düzenleme", "edit"],
+        "LongPress": ["long press", "press and hold", "uzun bas", "longpress"],
+        "VisibilityRule": ["should not appear", "must not", "not displayed", "görünmemeli", "olmamalı", "disable", "disabled", "enabled"],
+        "Navigation": ["back", "geri", "close", "kapat"]
     }
+    ui_hits = _find_hits(text, UI_RULES)
+    if ui_hits:
+        return ("Medium", "Functional UI/interaction rule validation", "UIRule", ", ".join(ui_hits))
 
-    COSMETIC_LOW = {
+    # 5) Low: cosmetic only
+    COSMETIC = {
         "Cosmetic/UI": ["alignment", "padding", "margin", "font", "typo", "spelling", "icon", "color", "theme", "animation", "ux", "ui", "çeviri", "metin"]
     }
-
-    matched = []
-
-    # 1) Always-gating risks
-    risk_hits = find_signals(text, RISK_ALWAYS_GATING)
-    if risk_hits:
-        matched += risk_hits
-        if "Privacy/Security" in risk_hits:
-            return ("Gating", "Privacy/Security coverage is release-critical", "Privacy/Security", matched)
-        return ("Gating", "Data loss / backup-restore coverage is release-critical", "DataLoss", matched)
-
-    # 2) Core smoke => Gating
-    smoke_hits = find_signals(text, CORE_SMOKE)
-    if smoke_hits:
-        matched += smoke_hits
-        return ("Gating", "Core smoke (must-pass) scenario", "CoreSmoke", matched)
-
-    # 3) Important variations on core features => High
-    var_hits = find_signals(text, VARIATIONS_HIGH)
-    if var_hits:
-        matched += var_hits
-        return ("High", "Important variation on core capability", "CoreVariation", matched)
-
-    # 4) UI/interaction rule validation (functional but not release-blocker) => Medium
-    ui_hits = find_signals(text, UI_RULES_MEDIUM)
-    if ui_hits:
-        matched += ui_hits
-        return ("Medium", "Functional UI/interaction rule validation", "UIRule", matched)
-
-    # 5) Pure cosmetic => Low
-    cos_hits = find_signals(text, COSMETIC_LOW)
+    cos_hits = _find_hits(text, COSMETIC)
     if cos_hits:
-        matched += cos_hits
-        return ("Low", "Cosmetic / UI-only scenario", "Cosmetic", matched)
+        return ("Low", "Cosmetic / UI-only scenario", "Cosmetic", ", ".join(cos_hits))
 
-    # 6) Status core override (optional)
+    # optional: Status core knob
     if status_core and safe_text(repo_path).lower().startswith("/status"):
-        return ("High", "Status treated as core area (fallback)", "StatusCore", matched)
+        return ("High", "Status treated as core area (fallback)", "StatusCore", "")
 
     # default
-    return ("Medium", "Default functional coverage", "Default", matched)
+    return ("Medium", "Default functional coverage", "Default", "")
 
 # -------------------------------
 # UI
@@ -188,9 +182,10 @@ with st.sidebar:
 uploaded = st.file_uploader("CSV yükle", type=["csv"])
 
 if not uploaded:
-    st.info("Bir CSV yükleyince RBTP_Priority hesaplayıp indirilebilir dosya üreteceğim.")
+    st.info("Bir CSV yükleyince STP_Priority hesaplayıp indirilebilir dosya üreteceğim.")
     st.stop()
 
+# Read CSV
 try:
     df = pd.read_csv(uploaded, sep=sep, dtype=str, keep_default_na=False)
 except Exception as e:
@@ -199,12 +194,14 @@ except Exception as e:
 
 st.success(f"Yüklendi: {len(df):,} satır, {len(df.columns)} kolon")
 
+# Auto-detect columns
 default_summary = pick_column(df, ["Summary", "summary"])
 default_repo = pick_column(df, ["Custom field (Test Repository Path)", "Test Repository Path", "RepositoryPath", "Repository Path"])
 default_steps = pick_column(df, ["Custom field (Manual Test Steps)", "Manual Test Steps", "Actions", "Action"])
 default_expected = pick_column(df, ["Custom field (Scenario Expected Result)", "Scenario Expected Result", "Expected", "Expected Result"])
 default_priority = pick_column(df, ["Priority", "CurrentPriority"])
 
+# Let user override
 summary_col = st.sidebar.selectbox("Summary kolonu", options=df.columns, index=(df.columns.get_loc(default_summary) if default_summary else 0))
 repo_col = st.sidebar.selectbox("RepositoryPath kolonu", options=df.columns, index=(df.columns.get_loc(default_repo) if default_repo else 0))
 steps_col = st.sidebar.selectbox("Actions/Steps kolonu", options=["(yok)"] + list(df.columns),
@@ -214,6 +211,7 @@ expected_col = st.sidebar.selectbox("Expected kolonu", options=["(yok)"] + list(
 priority_col = st.sidebar.selectbox("Mevcut Priority kolonu", options=["(yok)"] + list(df.columns),
                                     index=(1 + df.columns.get_loc(default_priority) if default_priority else 0))
 
+# Build derived texts
 summaries = df[summary_col].map(safe_text)
 repo_paths = df[repo_col].map(safe_text)
 
@@ -227,7 +225,7 @@ if expected_col != "(yok)":
 else:
     expected_text = pd.Series([""] * len(df))
 
-# Priority output handling (single column named Priority; drop original selected column if different)
+# Current priority normalization into one output column: Priority
 if priority_col != "(yok)":
     df["Priority"] = df[priority_col].map(normalize_priority)
     if priority_col != "Priority" and priority_col in df.columns:
@@ -235,26 +233,27 @@ if priority_col != "(yok)":
 else:
     df["Priority"] = ""
 
-# Compute RBTP (semantic heuristics)
-rows = []
+# Compute STP
+out_rows = []
 for i in range(len(df)):
-    pr, reason, rtype, matched = classify_rbtp_semantic(
+    pr, reason, rtype, matched = stp_classify(
         summaries.iat[i],
         repo_paths.iat[i],
         steps_text.iat[i],
         expected_text.iat[i],
         status_core=status_core
     )
-    rows.append((pr, reason, rtype, ", ".join(matched)))
+    out_rows.append((pr, reason, rtype, matched))
 
-df["RBTP_Priority"] = [r[0] for r in rows]
-df["RBTP_ChangeReason"] = [r[1] for r in rows]
-df["RBTP_RiskType"] = [r[2] for r in rows]
-df["RBTP_MatchedSignals"] = [r[3] for r in rows]
-df["RBTP_Changed"] = (df["Priority"] != "") & (df["Priority"] != df["RBTP_Priority"])
+df["STP_Priority"] = [r[0] for r in out_rows]
+df["STP_Reason"] = [r[1] for r in out_rows]
+df["STP_RiskType"] = [r[2] for r in out_rows]
+df["STP_MatchedSignals"] = [r[3] for r in out_rows]
 
-# Move Priority + RBTP_Priority to the end (last two columns)
-df = move_cols_to_end(df, ["Priority", "RBTP_Priority"])
+df["STP_Changed"] = (df["Priority"] != "") & (df["Priority"] != df["STP_Priority"])
+
+# Put Priority + STP_Priority at the end
+df = move_cols_to_end(df, ["Priority", "STP_Priority"])
 
 # Preview
 st.subheader("Önizleme")
@@ -266,7 +265,7 @@ st.dataframe(df.head(50), use_container_width=True)
 st.subheader("Dağılım ve Değişim Analizi")
 
 prev_counts = df["Priority"].fillna("").replace("", "(boş)").value_counts()
-next_counts = df["RBTP_Priority"].fillna("").replace("", "(boş)").value_counts()
+next_counts = df["STP_Priority"].fillna("").replace("", "(boş)").value_counts()
 
 compare = pd.DataFrame({
     "Önceki Adet": prev_counts,
@@ -285,19 +284,18 @@ with c1:
     st.write("Önceki vs Sonraki (adet + fark + oran)")
     st.dataframe(compare, use_container_width=True)
 
-changed = int(df["RBTP_Changed"].sum())
+changed = int(df["STP_Changed"].sum())
 total = len(df)
 changed_rate = round(changed / total * 100, 1) if total else 0.0
-
 with c2:
     st.metric("Değişen Senaryo", changed, f"{changed_rate}%")
 with c3:
     st.metric("Aynı Kalan", total - changed, f"{round(100 - changed_rate, 1)}%")
 
-st.write("Priority → RBTP_Priority geçiş matrisi")
+st.write("Priority → STP_Priority geçiş matrisi")
 transition = pd.crosstab(
     df["Priority"].replace("", "(boş)"),
-    df["RBTP_Priority"].replace("", "(boş)")
+    df["STP_Priority"].replace("", "(boş)")
 ).reindex(index=order, columns=order, fill_value=0)
 st.dataframe(transition, use_container_width=True)
 
@@ -306,9 +304,9 @@ st.subheader("İndir")
 out = io.StringIO()
 df.to_csv(out, sep=";", index=False)
 st.download_button(
-    label="RBTP çıktısını indir (CSV ;)",
+    label="STP çıktısını indir (CSV ;)",
     data=out.getvalue().encode("utf-8"),
-    file_name="RBTP_Output.csv",
+    file_name="STP_Output.csv",
     mime="text/csv"
 )
 
